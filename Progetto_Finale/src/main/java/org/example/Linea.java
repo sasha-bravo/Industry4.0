@@ -37,6 +37,18 @@ public class Linea {
     private static boolean batchTimerRunning = false;
     private static boolean containerScaricato = false;
 
+    // Soglie botole — CALIBRARE con le stampe di debug
+    private static final double SOGLIA_APERTURA_DX = 115.0; // aperta se maggiore di 115
+    private static final double SOGLIA_APERTURA_SX = 193.0; // aperta se minore di 193
+
+    // Buffer latency — tempo da smistatore a botola
+    private static Instant smistatoreDxOpenTime = null; // quando smistatore apre verso DX
+    private static Instant smistatoreSxOpenTime = null; // quando smistatore apre verso SX
+    private static boolean smistatoreDxAperto = false;
+    private static boolean smistatoreSxAperto = false;
+    private static boolean botolaDxAperta = false;
+    private static boolean botolaSxAperta = false;
+
     // Soglia ranger per container scaricato (cm) — calibra in base alla tua linea
     private static final double DIST_CONTAINER_SCARICATO = 10;
 
@@ -114,6 +126,8 @@ public class Linea {
                 double currentDx = botoladxDegree.getDegrees();
                 double currentSx = botolasxDegree.getDegrees();
 
+
+
                 BallItem ball = null;
 
                 // --- Logica conteggio e rilevamento palline ---
@@ -122,8 +136,11 @@ public class Linea {
                         totalOk++;
                         inZonaScarico = true;
                         ball = new BallItem("OK");
-
                         batchManager.addBall(ball);
+
+                        //smistatore apre verso sinistra -> avvia timer buffer sx
+                        smistatoreSxOpenTime = Instant.now();
+                        smistatoreSxAperto = true;
                         System.out.println("[INFO] Farmaco CONFORME rilevato. Totale OK: " + totalOk);
                     }
                 } else if (currentAngle > 200.0) {
@@ -133,6 +150,9 @@ public class Linea {
                         ball = new BallItem("CONTAMINATO");
                         ball.addWarning("CONTAMINATO", "angle=" + currentAngle);
                         batchManager.addBall(ball);
+                        //smistatore apre verso destra -> avvia timer buffer dx
+                        smistatoreDxOpenTime = Instant.now();
+                        smistatoreDxAperto = true;
                         System.err.println("[INFO] Farmaco CONTAMINATO rilevato! Totale Scarti: " + totalContaminated);
                     }
                 } else {
@@ -173,6 +193,74 @@ public class Linea {
                     writeApi.writePoint(bucket, org, sorterPoint);
                 }
 
+                // 4. measurement grezzo botole
+                try {
+                    Point botolaDxPoint = Point.measurement("botola_dx")
+                            .addField("angle", currentDx)
+                            .time(Instant.now(), WritePrecision.NS);
+                    writeApi.writePoint(bucket, org, botolaDxPoint);
+
+                    Point botolaSxPoint = Point.measurement("botola_sx")
+                            .addField("angle", currentSx)
+                            .time(Instant.now(), WritePrecision.NS);
+                    writeApi.writePoint(bucket, org, botolaSxPoint);
+                } catch (Exception e) {
+                    System.err.println("[INFLUX ERROR botole] " + e.getMessage());
+                }
+
+                // 5. buffer latency DX
+                // smistatore aveva aperto verso DX, aspetto che botola_dx si apra
+                if (smistatoreDxAperto && !botolaDxAperta) {
+                    if (currentDx > SOGLIA_APERTURA_DX) {
+                        // botola DX si è aperta → calcola latenza
+                        botolaDxAperta = true;
+                        long latenzaMs = Duration.between(smistatoreDxOpenTime, Instant.now()).toMillis();
+                        System.out.println("[BUFFER DX] latenza=" + latenzaMs + "ms");
+                        try {
+                            Point bufferPoint = Point.measurement("buffer_latency")
+                                    .addTag("botola", "dx")
+                                    .addTag("uuid_batch", batchManager.getCurrentBatchUuid())
+                                    .addField("latenza_ms", latenzaMs)
+                                    .time(Instant.now(), WritePrecision.NS);
+                            writeApi.writePoint(bucket, org, bufferPoint);
+                        } catch (Exception e) {
+                            System.err.println("[INFLUX ERROR buffer_dx] " + e.getMessage());
+                        }
+                    }
+                }
+                // reset quando botola DX si richiude
+                if (botolaDxAperta && currentDx <= SOGLIA_APERTURA_DX) {
+                    botolaDxAperta     = false;
+                    smistatoreDxAperto = false;
+                }
+
+                // 6. buffer latency SX
+                if (smistatoreSxAperto && !botolaSxAperta) {
+                    if (currentSx < SOGLIA_APERTURA_SX) {
+                        // botola SX si è aperta → calcola latenza
+                        botolaSxAperta = true;
+                        long latenzaMs = Duration.between(smistatoreSxOpenTime, Instant.now()).toMillis();
+                        System.out.println("[BUFFER SX] latenza=" + latenzaMs + "ms");
+                        try {
+                            Point bufferPoint = Point.measurement("buffer_latency")
+                                    .addTag("botola", "sx")
+                                    .addTag("uuid_batch", batchManager.getCurrentBatchUuid())
+                                    .addField("latenza_ms", latenzaMs)
+                                    .time(Instant.now(), WritePrecision.NS);
+                            writeApi.writePoint(bucket, org, bufferPoint);
+                        } catch (Exception e) {
+                            System.err.println("[INFLUX ERROR buffer_sx] " + e.getMessage());
+                        }
+                    }
+                }
+                // reset quando botola SX si richiude
+                if (botolaSxAperta && currentSx >= SOGLIA_APERTURA_SX) {
+                    botolaSxAperta     = false;
+                    smistatoreSxAperto = false;
+                }
+
+
+
                 // --- Rilevamento fine batch tramite ranger (container scaricato) ---
                 if (monitor_ranger.isValid()) {
                     double distanza = monitor_ranger.getValue();
@@ -190,6 +278,20 @@ public class Linea {
                             .time(Instant.now(), WritePrecision.NS);
                     writeApi.writePoint(bucket, org, rangerPoint);
                     if (batchTimerRunning && !containerScaricato && !present) {
+
+                        int totPalline = totalOk + totalContaminated;
+                        if (totPalline < BatchManager.BATCH_SIZE) {
+                            System.err.println("[WARNING] Batch incompleto: " + totPalline + "/" + BatchManager.BATCH_SIZE + " palline");
+                            try {
+                                Point warningPoint = Point.measurement("warning")
+                                        .addTag("uuid_batch", batchManager.getCurrentBatchUuid())
+                                        .addField("message", "BATCH_INCOMPLETO: " + totPalline + "/" + BatchManager.BATCH_SIZE)
+                                        .time(Instant.now(), WritePrecision.NS);
+                                writeApi.writePoint(bucket, org, warningPoint);
+                            } catch (Exception e) {
+                                System.err.println("[INFLUX ERROR warning] " + e.getMessage());
+                            }
+                        }
 
                         containerScaricato = true;
                         Instant fineScarico = Instant.now();
