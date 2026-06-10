@@ -7,6 +7,8 @@ import com.influxdb.client.domain.WritePrecision;
 import com.influxdb.client.write.Point;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.iot.raspberry.grovepi.GrovePi;
@@ -26,7 +28,8 @@ public class Linea {
     // Conteggio prodotti
     private static int totalOk = 0;
     private static int totalContaminated = 0;
-    private static boolean inZonaScarico = false;
+    private static boolean inZonaScaricoDx = false;
+    private static boolean inZonaScaricoSx = false;
 
     // Warning stasi smistatore (tuo originale)
     private static Instant lastMovementTime = Instant.now();
@@ -42,12 +45,9 @@ public class Linea {
     private static final double SOGLIA_APERTURA_SX = 193.0; // aperta se minore di 193
 
     // Buffer latency — tempo da smistatore a botola
-    private static Instant smistatoreDxOpenTime = null; // quando smistatore apre verso DX
-    private static Instant smistatoreSxOpenTime = null; // quando smistatore apre verso SX
-    private static boolean smistatoreDxAperto = false;
-    private static boolean smistatoreSxAperto = false;
-    private static boolean botolaDxAperta = false;
-    private static boolean botolaSxAperta = false;
+    private static BallItem pendingBallDx = null;
+    private static BallItem pendingBallSx = null;
+
 
     // Soglia ranger per container scaricato (cm) — calibra in base alla tua linea
     private static final double DIST_CONTAINER_SCARICATO = 10;
@@ -55,7 +55,6 @@ public class Linea {
     // warning stasi
     private static boolean warningStasiAttivo = false;
 
-    private static Instant lastBotolaDxSeenTime = null;
 
     public static void main(String[] args) throws Exception {
         Logger.getLogger("").setLevel(Level.OFF);
@@ -72,13 +71,13 @@ public class Linea {
         SensorMonitor<Double> monitor_ranger = new SensorMonitor<>(ranger, 500L);
 
         GroveRotarySensor smistatore = new GroveRotarySensor(grovePi, 0);
-        SensorMonitor<GroveRotaryValue> monitor_rotor = new SensorMonitor<>(smistatore, 50L);
+        SensorMonitor<GroveRotaryValue> monitor_rotor = new SensorMonitor<>(smistatore, 20L);
 
         GroveRotarySensor botola_dx = new GroveRotarySensor(grovePi, 1);
-        SensorMonitor<GroveRotaryValue> monitor_rotor_dx = new SensorMonitor<>(botola_dx, 50L);
+        SensorMonitor<GroveRotaryValue> monitor_rotor_dx = new SensorMonitor<>(botola_dx, 20L);
 
         GroveRotarySensor botola_sx = new GroveRotarySensor(grovePi, 2);
-        SensorMonitor<GroveRotaryValue> monitor_rotor_sx = new SensorMonitor<>(botola_sx, 50L);
+        SensorMonitor<GroveRotaryValue> monitor_rotor_sx = new SensorMonitor<>(botola_sx, 20L);
 
         GroveButton onOffButton = new GroveButton(grovePi, 3);
         SensorMonitor<Boolean> onOffButtonMonitor = new SensorMonitor<>(onOffButton, 50L);
@@ -132,31 +131,32 @@ public class Linea {
 
                 // --- Logica conteggio e rilevamento palline ---
                 if (currentAngle < 170.0) {
-                    if (!inZonaScarico) {
+                    if (!inZonaScaricoDx) {
                         totalOk++;
-                        inZonaScarico = true;
+                        inZonaScaricoDx = true;
                         ball = new BallItem("OK");
+                        ball.setSmistatoreOpenTime(Instant.now());
+                        pendingBallDx = ball;
                         batchManager.addBall(ball);
 
-                        //smistatore apre verso sinistra -> avvia timer buffer sx
-                        smistatoreSxOpenTime = Instant.now();
-                        smistatoreSxAperto = true;
                         System.out.println("[INFO] Farmaco CONFORME rilevato. Totale OK: " + totalOk);
                     }
                 } else if (currentAngle > 200.0) {
-                    if (!inZonaScarico) {
+                    if (!inZonaScaricoSx) {
                         totalContaminated++;
-                        inZonaScarico = true;
+                        inZonaScaricoSx = true;
                         ball = new BallItem("CONTAMINATO");
                         ball.addWarning("CONTAMINATO", "angle=" + currentAngle);
+                        ball.setSmistatoreOpenTime(Instant.now());
+                        pendingBallSx = ball;
                         batchManager.addBall(ball);
-                        //smistatore apre verso destra -> avvia timer buffer dx
-                        smistatoreDxOpenTime = Instant.now();
-                        smistatoreDxAperto = true;
+
                         System.err.println("[INFO] Farmaco CONTAMINATO rilevato! Totale Scarti: " + totalContaminated);
                     }
                 } else {
-                    inZonaScarico = false;
+                    inZonaScaricoDx = false;
+                    inZonaScaricoSx = false;
+
                 }
 
                 // --- Warning stasi smistatore (tuo originale) ---
@@ -210,17 +210,16 @@ public class Linea {
 
                 // 5. buffer latency DX
                 // smistatore aveva aperto verso DX, aspetto che botola_dx si apra
-                if (smistatoreDxAperto && !botolaDxAperta) {
+                if (pendingBallDx != null && !pendingBallDx.hasLatenza()) {
                     if (currentDx > SOGLIA_APERTURA_DX) {
-                        // botola DX si è aperta → calcola latenza
-                        botolaDxAperta = true;
-                        long latenzaMs = Duration.between(smistatoreDxOpenTime, Instant.now()).toMillis();
-                        System.out.println("[BUFFER DX] latenza=" + latenzaMs + "ms");
+                        pendingBallDx.calcolaLatenza();
+                        System.out.println("[BUFFER DX] latenza=" + pendingBallDx.getLatenzaMs() + "ms");
                         try {
                             Point bufferPoint = Point.measurement("buffer_latency")
                                     .addTag("botola", "dx")
                                     .addTag("uuid_batch", batchManager.getCurrentBatchUuid())
-                                    .addField("latenza_ms", latenzaMs)
+                                    .addTag("uuid_farmaco", pendingBallDx.ballUuid)
+                                    .addField("latenza_ms", pendingBallDx.getLatenzaMs())
                                     .time(Instant.now(), WritePrecision.NS);
                             writeApi.writePoint(bucket, org, bufferPoint);
                         } catch (Exception e) {
@@ -229,23 +228,22 @@ public class Linea {
                     }
                 }
                 // reset quando botola DX si richiude
-                if (botolaDxAperta && currentDx <= SOGLIA_APERTURA_DX) {
-                    botolaDxAperta     = false;
-                    smistatoreDxAperto = false;
+                if (pendingBallDx != null && pendingBallDx.hasLatenza() && currentDx <= SOGLIA_APERTURA_DX) {
+                    pendingBallDx = null;
                 }
 
                 // 6. buffer latency SX
-                if (smistatoreSxAperto && !botolaSxAperta) {
+                // smistatore aveva aperto verso DX, aspetto che botola_dx si apra
+                if (pendingBallSx != null && !pendingBallSx.hasLatenza()) {
                     if (currentSx < SOGLIA_APERTURA_SX) {
-                        // botola SX si è aperta → calcola latenza
-                        botolaSxAperta = true;
-                        long latenzaMs = Duration.between(smistatoreSxOpenTime, Instant.now()).toMillis();
-                        System.out.println("[BUFFER SX] latenza=" + latenzaMs + "ms");
+                        pendingBallSx.calcolaLatenza();
+                        System.out.println("[BUFFER SX] latenza=" + pendingBallSx.getLatenzaMs() + "ms");
                         try {
                             Point bufferPoint = Point.measurement("buffer_latency")
                                     .addTag("botola", "sx")
                                     .addTag("uuid_batch", batchManager.getCurrentBatchUuid())
-                                    .addField("latenza_ms", latenzaMs)
+                                    .addTag("uuid_farmaco", pendingBallSx.ballUuid)
+                                    .addField("latenza_ms", pendingBallSx.getLatenzaMs())
                                     .time(Instant.now(), WritePrecision.NS);
                             writeApi.writePoint(bucket, org, bufferPoint);
                         } catch (Exception e) {
@@ -254,10 +252,10 @@ public class Linea {
                     }
                 }
                 // reset quando botola SX si richiude
-                if (botolaSxAperta && currentSx >= SOGLIA_APERTURA_SX) {
-                    botolaSxAperta     = false;
-                    smistatoreSxAperto = false;
+                if (pendingBallSx != null && pendingBallSx.hasLatenza() && currentSx <= SOGLIA_APERTURA_SX) {
+                    pendingBallSx = null;
                 }
+
 
 
 
@@ -328,6 +326,8 @@ public class Linea {
 
                 }
             }
+
+            Thread.sleep(20);
         }
     }
 }
